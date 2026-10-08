@@ -1,0 +1,399 @@
+// lis3dsh_tests: the driver's functions over a double of the part: an
+// SPI bus and a GPIO port that together answer as an LIS3DSH's register
+// file does (DocID022405 § 5.2), so the address byte, the address
+// increment, the sign, the scaling and the bring-up are checked on the
+// host.  The board's suite runs the same functions over the board's bus.
+// The type `Lis3dsh` holds the board's handles; on the host those are
+// absent hardware, so the last test runs each of its methods as for a
+// part that does not answer.
+
+use std.test
+use embedded_hal.{ SpiBus, GpioOut, BoardSpi, BoardGpio }
+use dev_bus.{ DeviceWiring, DevBytes }
+use dev_accel.{ AccelMilliG, AccelRange, Accelerometer }
+use dev_id.{ Identifiable }
+use lis3dsh
+use lis3dsh.{ Lis3dsh }
+
+// ── The double ───────────────────────────────────────────────────────
+//
+// `regs` is the part's 128 registers.  `st` is the state of the
+// transaction in progress, shared with the GPIO double: key 0 is 0
+// before the address byte and 1 after it, key 1 the register address,
+// key 2 1 for a read, key 4 1 when a part is there at all, key 5 the
+// number of transactions begun, key 6 the last address byte sent and key
+// 7 the number of data bytes moved in the transaction.  The address
+// advances after each byte only while CTRL_REG6.ADD_INC (0x25, bit 4) is
+// set, as on the part (§ 5.2).  A part that is not there drives
+// nothing, and the bus reads 0xFF.  The state is kept in maps, which a
+// method changes through its receiver.
+
+struct FakePart
+    regs: HashMap<Int, Int>
+    st: HashMap<Int, Int>
+
+fn at(m: HashMap<Int, Int>, k: Int) -> Int
+    m.get(k) ?? 0
+
+impl SpiBus for FakePart
+    fn init(self, freq: Int, mode: Int) [hw]
+        self.st.insert(8, mode)
+
+    fn transfer(self, b: Int) -> Int [hw]
+        if at(self.st, 4) == 0
+            return 0xFF
+        if at(self.st, 0) == 0
+            self.st.insert(0, 1)
+            self.st.insert(1, b & 0x7F)
+            self.st.insert(2, (b >> 7) & 1)
+            self.st.insert(6, b)
+            self.st.insert(7, 0)
+            return 0xFF
+        let a = at(self.st, 1)
+        self.st.insert(7, at(self.st, 7) + 1)
+        if (at(self.regs, 0x25) & 0x10) != 0
+            self.st.insert(1, (a + 1) & 0x7F)
+        if at(self.st, 2) == 1
+            return at(self.regs, a)
+        self.regs.insert(a, b & 0xFF)
+        0xFF
+
+    fn write(self, data: [u8]) [hw]
+        for b in data
+            let _ = self.transfer(b as Int)
+
+    fn read(self, n: Int) -> [u8] [hw]
+        var out: [u8] = []
+        for _i in 0..n
+            list.push(out, self.transfer(0xFF) as u8)
+        out
+
+// The GPIO double: a fall of any pin starts a transaction.  `levels`
+// keeps the last level written to each pin, and `modes` the last mode.
+struct FakePins
+    st: HashMap<Int, Int>
+    levels: HashMap<Int, Int>
+    modes: HashMap<Int, Int>
+
+impl GpioOut for FakePins
+    fn mode(self, pin: Int, dir: Int) [hw]
+        self.modes.insert(pin, dir)
+
+    fn set(self, pin: Int, val: Int) [hw]
+        self.levels.insert(pin, val)
+        if val == 0
+            self.st.insert(0, 0)
+            self.st.insert(5, at(self.st, 5) + 1)
+
+    fn get(self, pin: Int) -> Int [hw]
+        at(self.levels, pin)
+
+// A part with its registers at their reset values (Rev 3, Table 15):
+// WHO_AM_I 0x3F, CTRL_REG4 0x07, CTRL_REG6 0x10.
+fn part() -> FakePart
+    let p = FakePart { regs: HashMap.new(), st: HashMap.new() }
+    p.regs.insert(0x0F, 0x3F)
+    p.regs.insert(0x20, 0x07)
+    p.regs.insert(0x25, 0x10)
+    p.st.insert(4, 1)
+    p
+
+fn pins(p: FakePart) -> FakePins
+    FakePins { st: p.st, levels: HashMap.new(), modes: HashMap.new() }
+
+// The board's wiring: chip select PE3 (67), INT1 PE0 (64).
+fn wiring() -> DeviceWiring
+    dev_bus.wiring_irq(dev_bus.wiring_spi(0, 67), 64)
+
+// Writes a 16-bit count, low byte first, at `reg`.
+fn put16(p: FakePart, reg: Int, v: Int)
+    let u = v & 0xFFFF
+    p.regs.insert(reg, u & 0xFF)
+    p.regs.insert(reg + 1, u >> 8)
+
+// Sets one register of the part.
+fn poke(p: FakePart, reg: Int, v: Int)
+    p.regs.insert(reg, v)
+
+// ── Register access ──────────────────────────────────────────────────
+
+@test
+fn test_a_read_sets_rw_and_sends_the_register_in_seven_bits() [io, hw]
+    let p = part()
+    let g = pins(p)
+    test.assert_eq(lis3dsh.reg_read(p, g, wiring(), 0x0F) ?? -1, 0x3F)
+    test.assert_eq(at(p.st, 6), 0x8F)
+    test.assert_eq(at(p.st, 2), 1)
+    test.assert_eq(at(g.levels, 67), 1)
+    // A register above 0x3F keeps bit 6: it is the address's, not a flag.
+    poke(p, 0x5F, 0x12)
+    test.assert_eq(lis3dsh.reg_read(p, g, wiring(), 0x5F) ?? -1, 0x12)
+    test.assert_eq(at(p.st, 6), 0xDF)
+
+@test
+fn test_a_sample_is_one_read_of_six_bytes_without_bit_6() [io, hw]
+    let p = part()
+    put16(p, 0x28, 1000)
+    put16(p, 0x2A, 2000)
+    put16(p, 0x2C, 3000)
+    match lis3dsh.sample_read(p, pins(p), wiring())
+        Some(s) =>
+            test.assert_eq(s.x, 60)
+            test.assert_eq(s.y, 120)
+            test.assert_eq(s.z, 180)
+        None    => test.assert(false)
+    // The last transaction is the burst: OUT_X_L with RW set, bit 6 clear,
+    // six bytes moved.
+    test.assert_eq(at(p.st, 6), 0xA8)
+    test.assert_eq(at(p.st, 7), 6)
+
+@test
+fn test_the_burst_needs_the_address_increment() [io, hw]
+    let p = part()
+    put16(p, 0x28, 1000)
+    put16(p, 0x2A, 2000)
+    // With ADD_INC clear, every byte repeats OUT_X_L, as on the part.
+    poke(p, 0x25, 0x00)
+    match lis3dsh.sample_read(p, pins(p), wiring())
+        Some(s) => test.assert(s.y != 120)
+        None    => test.assert(false)
+    // The bring-up sets it.
+    test.assert(lis3dsh.start(p, pins(p), wiring()))
+    test.assert_eq(at(p.regs, 0x25), 0x10)
+    match lis3dsh.sample_read(p, pins(p), wiring())
+        Some(s) => test.assert_eq(s.y, 120)
+        None    => test.assert(false)
+
+@test
+fn test_a_write_is_read_back() [io, hw]
+    let p = part()
+    test.assert(lis3dsh.reg_write(p, pins(p), wiring(), 0x23, 0xC8))
+    test.assert_eq(at(p.regs, 0x23), 0xC8)
+    // The write's address byte has RW clear.
+    test.assert_eq(at(p.st, 6), 0xA3)
+
+@test
+fn test_a_wiring_with_no_chip_select_sends_nothing() [io, hw]
+    let p = part()
+    let w = DeviceWiring { bus: 0, addr: None, cs: None, irq: None }
+    test.assert(lis3dsh.reg_read(p, pins(p), w, 0x0F) == None)
+    test.assert(not lis3dsh.reg_write(p, pins(p), w, 0x20, 0x67))
+    test.assert(lis3dsh.sample_read(p, pins(p), w) == None)
+    test.assert(not lis3dsh.start(p, pins(p), w))
+    test.assert_eq(at(p.st, 5), 0)
+
+// ── Sign and scale ───────────────────────────────────────────────────
+
+@test
+fn test_negative_counts_are_sign_extended() [io, hw]
+    let p = part()
+    // -1 is 0xFFFF; -32768 is 0x8000; 32767 is 0x7FFF.
+    put16(p, 0x28, -1)
+    put16(p, 0x2A, -32768)
+    put16(p, 0x2C, 32767)
+    match lis3dsh.sample_read(p, pins(p), wiring())
+        Some(s) =>
+            test.assert_eq(s.x, 0)
+            test.assert_eq(s.y, -1966)
+            test.assert_eq(s.z, 1966)
+        None    => test.assert(false)
+    put16(p, 0x28, -16667)
+    match lis3dsh.sample_read(p, pins(p), wiring())
+        Some(s) => test.assert_eq(s.x, -1000)
+        None    => test.assert(false)
+
+@test
+fn test_each_scale_has_its_sensitivity() [io, hw]
+    let p = part()
+    let g = pins(p)
+    put16(p, 0x28, 10000)
+    put16(p, 0x2A, -10000)
+    // 10000 counts at 0.06, 0.12, 0.18, 0.24 and 0.73 mg a step.
+    let want = [600, 1200, 1800, 2400, 7300]
+    let scales = [2, 4, 6, 8, 16]
+    for i in 0..5
+        test.assert(lis3dsh.scale_write(p, g, wiring(), scales[i]))
+        test.assert_eq(lis3dsh.scale_read(p, g, wiring()), scales[i])
+        match lis3dsh.sample_read(p, g, wiring())
+            Some(s) =>
+                test.assert_eq(s.x, want[i])
+                test.assert_eq(s.y, 0 - want[i])
+            None    => test.assert(false)
+    // FSCALE sits in bits 5 to 3 of CTRL_REG5; ±16 g is 100.
+    test.assert_eq(at(p.regs, 0x24), 0x20)
+
+@test
+fn test_a_scale_change_keeps_the_other_bits() [io, hw]
+    let p = part()
+    let g = pins(p)
+    poke(p, 0x24, 0xC0)
+    test.assert(lis3dsh.scale_write(p, g, wiring(), 8))
+    test.assert_eq(at(p.regs, 0x24), 0xD8)
+    test.assert(not lis3dsh.scale_write(p, g, wiring(), 3))
+    test.assert_eq(at(p.regs, 0x24), 0xD8)
+
+@test
+fn test_the_codes_and_their_ranges() [io, hw]
+    test.assert(lis3dsh.range_of_code(0) == Some(AccelRange2g))
+    test.assert(lis3dsh.range_of_code(1) == Some(AccelRange4g))
+    test.assert(lis3dsh.range_of_code(2) == None)
+    test.assert(lis3dsh.range_of_code(3) == Some(AccelRange8g))
+    test.assert(lis3dsh.range_of_code(4) == Some(AccelRange16g))
+    test.assert(lis3dsh.range_of_code(5) == None)
+    test.assert_eq(lis3dsh.code_of_range(AccelRange2g), 0)
+    test.assert_eq(lis3dsh.code_of_range(AccelRange4g), 1)
+    test.assert_eq(lis3dsh.code_of_range(AccelRange8g), 3)
+    test.assert_eq(lis3dsh.code_of_range(AccelRange16g), 4)
+    test.assert_eq(lis3dsh.scale_g_of_code(7), 0)
+    test.assert_eq(lis3dsh.code_of_scale_g(12), -1)
+    test.assert(lis3dsh.ctrl5_answered(0x20))
+    test.assert(not lis3dsh.ctrl5_answered(0xFF))
+    test.assert_eq(lis3dsh.milli_g(-3, 730), -2)
+
+// ── Rates ────────────────────────────────────────────────────────────
+
+@test
+fn test_the_rates_round_up_and_keep_the_low_bits() [io, hw]
+    let p = part()
+    let g = pins(p)
+    poke(p, 0x20, 0x0F)
+    test.assert_eq(lis3dsh.rate_write(p, g, wiring(), 3000), 3125)
+    test.assert_eq(at(p.regs, 0x20), 0x1F)
+    test.assert_eq(lis3dsh.rate_write(p, g, wiring(), 60000), 100000)
+    test.assert_eq(lis3dsh.rate_write(p, g, wiring(), 100001), 400000)
+    test.assert_eq(lis3dsh.rate_write(p, g, wiring(), 5000000), 1600000)
+    test.assert_eq(at(p.regs, 0x20), 0x9F)
+    test.assert_eq(lis3dsh.rate_read(p, g, wiring()), 1600000)
+    test.assert_eq(lis3dsh.rate_write(p, g, wiring(), 0), 0)
+    test.assert_eq(at(p.regs, 0x20), 0x0F)
+    test.assert_eq(lis3dsh.rate_mhz_of_code(10), 0)
+    test.assert_eq(lis3dsh.code_for_rate_mhz(12500), 3)
+
+@test
+fn test_a_rate_in_whole_hertz() [io, hw]
+    let p = part()
+    let g = pins(p)
+    test.assert_eq(lis3dsh.rate_hz_write(p, g, wiring(), 0), 3)
+    test.assert_eq(lis3dsh.rate_hz_write(p, g, wiring(), 3), 3)
+    test.assert_eq(lis3dsh.rate_hz_write(p, g, wiring(), 6), 6)
+    test.assert_eq(lis3dsh.rate_hz_write(p, g, wiring(), 100), 100)
+    test.assert_eq(lis3dsh.rate_read(p, g, wiring()), 100000)
+    p.st.insert(4, 0)
+    test.assert_eq(lis3dsh.rate_hz_write(p, g, wiring(), 100), 0)
+
+// ── Identity, bring-up and absence ───────────────────────────────────
+
+@test
+fn test_the_bring_up_writes_its_settings() [io, hw]
+    let p = part()
+    let g = pins(p)
+    test.assert(lis3dsh.start(p, g, wiring()))
+    test.assert_eq(at(p.regs, 0x25), 0x10)
+    test.assert_eq(at(p.regs, 0x24), 0x00)
+    test.assert_eq(at(p.regs, 0x20), 0x6F)
+    test.assert_eq(at(p.regs, 0x23), 0xE8)
+    // Mode 3; chip select an output, high; the interrupt pin an input.
+    test.assert_eq(at(p.st, 8), 3)
+    test.assert_eq(at(g.modes, 67), 1)
+    test.assert_eq(at(g.levels, 67), 1)
+    test.assert_eq(at(g.modes, 64), 0)
+    match lis3dsh.id_read(p, g, wiring())
+        Some(id) =>
+            test.assert_eq(id.who, 0x3F)
+            test.assert(id.rev == None)
+        None     => test.assert(false)
+
+@test
+fn test_another_part_is_refused() [io, hw]
+    // The LIS302DL, which early boards carry, answers 0x3B.
+    let p = part()
+    poke(p, 0x0F, 0x3B)
+    test.assert(not lis3dsh.start(p, pins(p), wiring()))
+    test.assert_eq(at(p.regs, 0x20), 0x07)
+
+@test
+fn test_no_part_reads_as_no_sample() [io, hw]
+    let p = part()
+    p.st.insert(4, 0)
+    let g = pins(p)
+    test.assert(lis3dsh.sample_read(p, g, wiring()) == None)
+    test.assert(lis3dsh.id_read(p, g, wiring()) == None)
+    test.assert_eq(lis3dsh.scale_read(p, g, wiring()), 0)
+    test.assert(not lis3dsh.scale_write(p, g, wiring(), 2))
+    test.assert_eq(lis3dsh.rate_read(p, g, wiring()), 0)
+    test.assert_eq(lis3dsh.rate_write(p, g, wiring(), 100000), -1)
+    test.assert(not lis3dsh.start(p, g, wiring()))
+    // A bus no part drives answers ZYXDA set; the sample says None.
+    test.assert(lis3dsh.sample_ready(p, g, wiring()))
+
+@test
+fn test_the_data_ready_flag() [io, hw]
+    let p = part()
+    test.assert(not lis3dsh.sample_ready(p, pins(p), wiring()))
+    poke(p, 0x27, 0x08)
+    test.assert(lis3dsh.sample_ready(p, pins(p), wiring()))
+
+@test
+fn test_the_interrupt_line() [io, hw]
+    let p = part()
+    let g = pins(p)
+    g.levels.insert(64, 1)
+    test.assert_eq(lis3dsh.irq_level_of(g, wiring()), 1)
+    test.assert_eq(lis3dsh.irq_level_of(g, dev_bus.wiring_spi(0, 67)), -1)
+
+// ── The driver's type over the board's handles ───────────────────────
+//
+// On a host the board's SPI bus is absent hardware whose every byte
+// reads 0, and the GPIO port prints each write.  So a part reads as
+// powered down at ±2 g with every register 0: a write of 0 reads back
+// and is taken, any other write is refused, and WHO_AM_I's 0 is no part.
+
+@test
+fn test_the_driver_over_a_bus_that_reads_zero() [io, hw]
+    let d = Lis3dsh.attach(BoardSpi { id: 0 }, BoardGpio { id: 0 }, wiring())
+    test.assert(not d.begin())
+    test.assert_eq(d.scale_g(), 2)
+    test.assert(not d.set_scale_g(4))
+    test.assert(d.set_scale_g(2))
+    test.assert_eq(d.rate_mhz(), 0)
+    test.assert_eq(d.set_rate_mhz(100000), -1)
+    test.assert_eq(d.set_rate_mhz(0), 0)
+    test.assert_eq(d.irq_level(), 0)
+    test.assert_eq(d.reg(0x0F) ?? -1, 0)
+    test.assert(not d.set_reg(0x20, 0x67))
+    test.assert(d.set_reg(0x20, 0))
+    println("sample ${d.accel_read() == None}")
+    println("ready ${d.accel_ready()}")
+    test.assert(d.accel_range() == AccelRange2g)
+    test.assert(not d.accel_set_range(AccelRange4g))
+    test.assert(d.accel_set_range(AccelRange2g))
+    test.assert_eq(d.accel_rate_hz(), 0)
+    test.assert_eq(d.accel_set_rate_hz(0), 0)
+    test.assert_eq(d.accel_set_rate_hz(100), 0)
+    test.assert(d.device_id() == None)
+
+// ── The helpers a caller with its own bus uses ───────────────────────
+
+@test
+fn test_a_burst_read_into_the_callers_bytes() [io, hw]
+    let p = part()
+    var b: DevBytes = Vec.new()
+    // CTRL_REG4 and CTRL_REG3 hold 0x07 and 0 at reset, and ADD_INC is
+    // set, so a read of two registers from 0x20 answers both.
+    p.regs.insert(0x21, 0x48)
+    test.assert(lis3dsh.reg_read_into(p, pins(p), wiring(), 0x20, 2, b))
+    test.assert_eq(b.len(), 2)
+    test.assert_eq(b[0] as Int, 0x07)
+    test.assert_eq(b[1] as Int, 0x48)
+    var none: DevBytes = Vec.new()
+    let w = DeviceWiring { bus: 0, addr: None, cs: None, irq: None }
+    test.assert(not lis3dsh.reg_read_into(p, pins(p), w, 0x20, 2, none))
+
+@test
+fn test_the_scale_field_and_its_sensitivity() [io]
+    test.assert_eq(lis3dsh.fscale_of_ctrl5(0x00), 0)
+    test.assert_eq(lis3dsh.fscale_of_ctrl5(0x20), 4)
+    test.assert_eq(lis3dsh.fscale_of_ctrl5(0xFF), 7)
+    test.assert_eq(lis3dsh.ug_per_lsb(0), 60)
+    test.assert_eq(lis3dsh.ug_per_lsb(3), 240)
+    test.assert_eq(lis3dsh.ug_per_lsb(4), 730)
