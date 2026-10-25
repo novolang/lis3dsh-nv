@@ -139,12 +139,12 @@ pub fn reg_read_into<B: SpiBus, G: GpioOut>(bus: B, gpio: G, w: DeviceWiring, re
                                             var dst: DevBytes) -> Bool [hw]
     var tx: DevBytes = Vec.new()
     let _ = tx.push((CMD_READ | (reg & 0x7F)) as u8)
-    dev_bus.wiring_spi_exchange_into(bus, gpio, w, tx, n, dst)
+    dev_bus.wiring_spi_exchange_into(bus, gpio, w, tx, n, var dst)
 
 // One register's byte, or `None` for a wiring with no chip select.
 pub fn reg_read<B: SpiBus, G: GpioOut>(bus: B, gpio: G, w: DeviceWiring, reg: Int) -> ?Int [hw]
     var b: DevBytes = Vec.new()
-    if not reg_read_into(bus, gpio, w, reg, 1, b)
+    if not reg_read_into(bus, gpio, w, reg, 1, var b)
         return None
     Some(b[0] as Int)
 
@@ -156,7 +156,7 @@ pub fn reg_write<B: SpiBus, G: GpioOut>(bus: B, gpio: G, w: DeviceWiring, reg: I
     let _ = tx.push((reg & 0x7F) as u8)
     let _ = tx.push((v & 0xFF) as u8)
     var none: DevBytes = Vec.new()
-    if not dev_bus.wiring_spi_exchange_into(bus, gpio, w, tx, 0, none)
+    if not dev_bus.wiring_spi_exchange_into(bus, gpio, w, tx, 0, var none)
         return false
     reg_read(bus, gpio, w, reg) == Some(v & 0xFF)
 
@@ -282,7 +282,7 @@ pub fn sample_read<B: SpiBus, G: GpioOut>(bus: B, gpio: G, w: DeviceWiring) -> ?
     if code < 0
         return None
     var b: DevBytes = Vec.new()
-    let _ = reg_read_into(bus, gpio, w, OUT_X_L, 6, b)
+    let _ = reg_read_into(bus, gpio, w, OUT_X_L, 6, var b)
     let k = ug_per_lsb(code)
     Some(AccelMilliG { x: milli_g(axis(b, 0), k), y: milli_g(axis(b, 2), k), z: milli_g(axis(b, 4), k) })
 
@@ -393,6 +393,7 @@ struct Lis3dsh
     pins: BoardGpio
     w: DeviceWiring
 
+// cov: skip — the type holds the board's bus handles, which exist only on a board; each method forwards to the function of the same name that the host suite covers, and a board package's suite runs these lines on the board.
 impl Lis3dsh
     // The part on the board's SPI bus with the chip select `w.cs`, as a
     // board's device table builds it.  Nothing is sent.
@@ -438,6 +439,7 @@ impl Lis3dsh
     fn set_reg(self, r: Int, v: Int) -> Bool [hw]
         reg_write(self.bus, self.pins, self.w, r, v)
 
+// cov: skip — the type holds the board's bus handles, which exist only on a board; each method forwards to the function of the same name that the host suite covers, and a board package's suite runs these lines on the board.
 impl Accelerometer[hw] for Lis3dsh
     fn accel_read(self) -> ?AccelMilliG [hw]
         sample_read(self.bus, self.pins, self.w)
@@ -464,6 +466,7 @@ impl Accelerometer[hw] for Lis3dsh
     fn accel_set_rate_hz(self, hz: Int) -> Int [hw]
         rate_hz_write(self.bus, self.pins, self.w, hz)
 
+// cov: skip — the type holds the board's bus handles, which exist only on a board; each method forwards to the function of the same name that the host suite covers, and a board package's suite runs these lines on the board.
 impl Identifiable[hw] for Lis3dsh
     // WHO_AM_I: 0x3F for an LIS3DSH; the part keeps no revision register,
     // so `rev` is `None`.

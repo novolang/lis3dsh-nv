@@ -323,3 +323,13 @@ fn test_the_interrupt_line() [io, hw]
     g.levels.insert(64, 1)
     test.assert_eq(lis3dsh.irq_level_of(g, wiring()), 1)
     test.assert_eq(lis3dsh.irq_level_of(g, dev_bus.wiring_spi(0, 67)), -1)
+
+@test
+fn test_the_rate_in_whole_hertz() [io, hw]
+    let p = part()
+    let g = pins(p)
+    poke(p, 0x20, 0x0F)
+    test.assert_eq(lis3dsh.rate_hz_write(p, g, wiring(), 0), 3)
+    test.assert_eq(lis3dsh.rate_hz_write(p, g, wiring(), 100), 100)
+    p.st.insert(4, 0)
+    test.assert_eq(lis3dsh.rate_hz_write(p, pins(p), wiring(), 100), 0)

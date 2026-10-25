@@ -1,6 +1,6 @@
 [package]
 name        = "lis3dsh-nv"
-version     = "0.1.0"
+version     = "0.1.1"
 description = "A driver for ST's LIS3DSH three-axis accelerometer on an SPI bus: the acceleration in milli-g, the five full scales, the ten output data rates, the data-ready line and WHO_AM_I, as devices-nv's Accelerometer and Identifiable."
 license     = "Apache-2.0"
 stability   = "experimental"
@@ -12,7 +12,7 @@ maintainers = ["novo-lang"]
 # The toolchain floor: 0.19.3 checks each module's generic functions
 # against its own module, which a program needs when it binds this
 # driver beside another that also declares `start` and `irq_level_of`.
-novo        = ">= 0.19.3"
+novo        = ">= 0.21.1"
 
 [dependencies]
 # The board's SPI bus and GPIO handles, and the SpiBus and GpioOut
