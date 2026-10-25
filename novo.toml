@@ -1,0 +1,23 @@
+[package]
+name        = "lis3dsh-nv"
+version     = "0.1.0"
+description = "A driver for ST's LIS3DSH three-axis accelerometer on an SPI bus: the acceleration in milli-g, the five full scales, the ten output data rates, the data-ready line and WHO_AM_I, as devices-nv's Accelerometer and Identifiable."
+license     = "Apache-2.0"
+stability   = "experimental"
+category    = "embedded"
+layer       = "host"
+tags        = ["lis3dsh", "accelerometer", "spi", "sensor", "stm32f407g-disc1"]
+repository  = "https://github.com/novolang/lis3dsh-nv"
+maintainers = ["novo-lang"]
+# The toolchain floor: 0.19.3 checks each module's generic functions
+# against its own module, which a program needs when it binds this
+# driver beside another that also declares `start` and `irq_level_of`.
+novo        = ">= 0.19.3"
+
+[dependencies]
+# The board's SPI bus and GPIO handles, and the SpiBus and GpioOut
+# traits they implement.
+embedded-hal-nv = "^0.2.1"
+# The wiring record a board's device table hands `attach`, the SPI
+# transaction helper, and the Accelerometer and Identifiable traits.
+devices-nv      = "^0.2.0"

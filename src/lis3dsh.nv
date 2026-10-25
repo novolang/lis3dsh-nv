@@ -1,0 +1,471 @@
+// lis3dsh: ST's LIS3DSH three-axis accelerometer on its SPI bus, as
+// devices-nv's `Accelerometer` and `Identifiable`.
+//
+// The part is described by ST's data sheet DocID022405, Rev 2 (October
+// 2015); the tables named below are that revision's.  Rev 2 leaves the
+// control registers' reset values blank, and Rev 3 (September 2017)
+// gives them in its Table 15: CTRL_REG4 0x07, CTRL_REG3 and CTRL_REG5
+// 0x00, CTRL_REG6 0x10.
+//
+// The register map (Table 15), as this driver uses it:
+//
+//   0x0F  WHO_AM_I    0x3F
+//   0x20  CTRL_REG4   ODR (7:4), BDU (3), ZEN (2), YEN (1), XEN (0)
+//                     (Table 21)
+//   0x23  CTRL_REG3   DR_EN (7), IEA (6), IEL (5), INT2_EN (4),
+//                     INT1_EN (3), VFILT (2), STRT (0) (Table 19)
+//   0x24  CTRL_REG5   BW (7:6), FSCALE (5:3), ST (2:1), SIM (0)
+//                     (Tables 24 and 25)
+//   0x25  CTRL_REG6   BOOT (7), FIFO_EN (6), WTM_EN (5), ADD_INC (4),
+//                     P1_EMPTY (3), P1_WTM (2), P1_OVERRUN (1),
+//                     P2_BOOT (0) (Table 27)
+//   0x27  STATUS      ZYXDA (3): a new sample of all three axes (Table 29)
+//   0x28  OUT_X_L to 0x2D OUT_Z_H: each axis a 16-bit two's complement
+//         count, low byte first
+//
+// The full scale and its sensitivity (Table 3, typical values): FSCALE
+// 000 is ±2 g at 0.06 mg per step, 001 ±4 g at 0.12, 010 ±6 g at 0.18,
+// 011 ±8 g at 0.24 and 100 ±16 g at 0.73.  The other codes are not
+// used.  The output data rate (Table 23): ODR 0000 powers the part
+// down, 0001 to 1001 are 3.125, 6.25, 12.5, 25, 50, 100, 400, 800 and
+// 1600 Hz.
+//
+// An SPI transaction (§ 5.2) is an address byte, then the data, inside
+// one chip-select window: bit 7 of the address byte is RW (1 reads) and
+// bits 6 to 0 the register.  The LIS3DSH has no MS bit in the address
+// byte, though Rev 2's figures still label bit 6 "MS": the address
+// advances after each byte of a multi-byte transfer while
+// CTRL_REG6.ADD_INC is set, and stays put while it is clear.  The part
+// drives SDO on SPC's falling edge and samples SDI on its rising edge,
+// with SPC idle high, which is SPI mode 3, at up to 10 MHz (Table 5).
+//
+// The drivers read before this one, for their fixes and nothing ported:
+// STM32CubeF4's component driver (stm32-lis3dsh at 54c73eb,
+// `lis3dsh.c`, `lis3dsh.h`) and its board support for the
+// STM32F4DISCOVERY (stm32f4discovery-bsp at 49fcaf4,
+// `stm32f4_discovery.c`, `stm32f4_discovery_accelerometer.c`), and
+// jbangelo's Rust `lis3dsh` crate 0.1.0 (commit 19f2732).  Each fix this
+// driver keeps, and each thing it does differently, is named where it
+// is kept:
+//
+//   - no MS bit: the BSP's `ACCELERO_IO_Read` ORs 0x40 into the address
+//     of a multi-byte read, the LIS302DL's MS bit, which on the LIS3DSH
+//     is address bit 6 (0x28 becomes 0x68, a state-machine register);
+//     the crate masks the address to seven bits, as `reg_read_into`
+//     does;
+//   - ADD_INC written in `start` rather than taken from its reset value,
+//     which the crate relies on;
+//   - BDU set and the six output bytes read in one transaction:
+//     neither driver sets BDU, and the component reads the six bytes in
+//     six transactions, which can mix two samples (`sample_read`);
+//   - the axis combined from unsigned bytes: the component's
+//     `int8_t buffer[6]` sign-extends the low byte and reads 256 counts
+//     low whenever it is 0x80 or more (`axis`);
+//   - whole fields cleared in a read-modify-write: the component clears
+//     ODR with 0x70 and FSCALE with 0x20, so it cannot leave 800 Hz, or
+//     ±4 g for ±2 g (`rate_write`, `scale_write`);
+//   - chip select high before the bus starts, as the BSP's
+//     `ACCELERO_IO_Init` and the crate's `new_spi` do (`start`);
+//   - WHO_AM_I checked before any setting, as `BSP_ACCELERO_Init` does
+//     to tell the LIS3DSH from the LIS302DL (`start`);
+//   - SPI mode 3, the data sheet's; the BSP runs the bus in mode 0;
+//   - the data-ready signal pulsed on INT1, as the crate has it; the
+//     bench shows why (`CTRL3_DRDY_INT1`).
+//
+// Left out: the crate's soft reset through CTRL_REG3.STRT followed by a
+// 5 ms wait, a time the data sheet does not give; `start` writes every
+// register the driver relies on instead.
+//
+// The driver holds no state: the scale and the rate are read from the
+// part when they are needed, so two copies of the driver's value agree.
+//
+// The functions over a bus take it as a type parameter, so the tests run
+// them over a double of the part; the methods of `Lis3dsh` call them with
+// the board's bus.
+
+use embedded_hal.{ BoardSpi, BoardGpio, SpiBus, GpioOut }
+use dev_bus.{ DeviceWiring, DevBytes }
+use dev_accel.{ AccelMilliG, AccelRange, Accelerometer }
+use dev_id.{ DeviceId, Identifiable }
+
+// The registers.
+let WHO_AM_I  = 0x0F
+let CTRL_REG4 = 0x20
+let CTRL_REG3 = 0x23
+let CTRL_REG5 = 0x24
+let CTRL_REG6 = 0x25
+let STATUS    = 0x27
+let OUT_X_L   = 0x28
+
+// The address byte's RW bit.
+let CMD_READ = 0x80
+
+// The identity WHO_AM_I answers (Table 15).
+pub const ID_LIS3DSH = 0x3F
+
+// CTRL_REG4: block data update and the three axes on, so the low and
+// high bytes of an axis come from one sample (Table 21).
+let CTRL4_BDU_XYZ = 0x0F
+// CTRL_REG3: the data-ready signal on INT1, active high and pulsed
+// (DR_EN, IEA, IEL, INT1_EN; Table 19), as jbangelo's crate sets it
+// (0xE8).  On the bench a pulse is 50 us long and comes once a sample;
+// latched (IEL clear), the line stays high and drops for about 130 us
+// before each new sample, and reading the sample does not clear it, so
+// the pulse is the form a program can count or take an edge interrupt
+// on.
+let CTRL3_DRDY_INT1 = 0xE8
+// CTRL_REG6: the register address advances in a multi-byte transfer.
+let CTRL6_ADD_INC = 0x10
+// STATUS: a new sample of all three axes.
+let STATUS_ZYXDA = 0x08
+
+// The rate `begin` sets: 100 Hz.
+let ODR_BEGIN = 6
+
+// The SPI clock `begin` asks for.  The part takes up to 10 MHz (Table
+// 5); the controller gives the fastest rate at or below this.
+let SPI_HZ   = 10000000
+let SPI_MODE = 3
+
+// Reads `n` registers from `reg` into `dst` in one transaction: RW set,
+// and the register in bits 6 to 0, with no MS bit: STM32CubeF4's
+// `ACCELERO_IO_Read` sets 0x40 for a multi-byte read, the LIS302DL's
+// MS bit, which here is the address's bit 6; jbangelo's crate masks the
+// address to seven bits, as this does.  The address advances through a
+// multi-byte read because `start` sets CTRL_REG6.ADD_INC.  Answers whether the transaction ran,
+// which on SPI is whether the wiring has a chip select: an absent part
+// reads 0xFF, which the callers check for.
+pub fn reg_read_into<B: SpiBus, G: GpioOut>(bus: B, gpio: G, w: DeviceWiring, reg: Int, n: Int,
+                                            var dst: DevBytes) -> Bool [hw]
+    var tx: DevBytes = Vec.new()
+    let _ = tx.push((CMD_READ | (reg & 0x7F)) as u8)
+    dev_bus.wiring_spi_exchange_into(bus, gpio, w, tx, n, dst)
+
+// One register's byte, or `None` for a wiring with no chip select.
+pub fn reg_read<B: SpiBus, G: GpioOut>(bus: B, gpio: G, w: DeviceWiring, reg: Int) -> ?Int [hw]
+    var b: DevBytes = Vec.new()
+    if not reg_read_into(bus, gpio, w, reg, 1, b)
+        return None
+    Some(b[0] as Int)
+
+// Writes `v` to the register `reg` and reads it back: whether the part
+// holds the value written.  An absent part reads back 0xFF.
+pub fn reg_write<B: SpiBus, G: GpioOut>(bus: B, gpio: G, w: DeviceWiring, reg: Int,
+                                        v: Int) -> Bool [hw]
+    var tx: DevBytes = Vec.new()
+    let _ = tx.push((reg & 0x7F) as u8)
+    let _ = tx.push((v & 0xFF) as u8)
+    var none: DevBytes = Vec.new()
+    if not dev_bus.wiring_spi_exchange_into(bus, gpio, w, tx, 0, none)
+        return false
+    reg_read(bus, gpio, w, reg) == Some(v & 0xFF)
+
+// The FSCALE code of a CTRL_REG5 byte, 0 to 7.
+pub fn fscale_of_ctrl5(v: Int) -> Int
+    (v >> 3) & 7
+
+// Whether a CTRL_REG5 byte is one a present part answers: its FSCALE is
+// one of the five codes the part uses, and a bus no part drives reads
+// 0xFF, FSCALE 111.
+pub fn ctrl5_answered(v: Int) -> Bool
+    fscale_of_ctrl5(v) <= 4
+
+// The full scale of an FSCALE code in g: 2, 4, 6, 8 or 16, and 0 for a
+// code the part does not use.
+pub fn scale_g_of_code(code: Int) -> Int
+    match code
+        0 => 2
+        1 => 4
+        2 => 6
+        3 => 8
+        4 => 16
+        _ => 0
+
+// The FSCALE code of a full scale in g, or -1 for a scale the part does
+// not have.
+pub fn code_of_scale_g(g: Int) -> Int
+    match g
+        2  => 0
+        4  => 1
+        6  => 2
+        8  => 3
+        16 => 4
+        _  => -1
+
+// The sensitivity of an FSCALE code in micro-g per step (Table 3): 60,
+// 120, 180, 240 and 730, the values STM32CubeF4's `lis3dsh.h` uses too.
+// The ±16 g step is 0.73 mg, not 16 g over 2^15 (0.49 mg): the data
+// sheet's sensitivity is the one to use.
+pub fn ug_per_lsb(code: Int) -> Int
+    match code
+        0 => 60
+        1 => 120
+        2 => 180
+        3 => 240
+        _ => 730
+
+// The devices-nv range of an FSCALE code.  ±6 g, which devices-nv's
+// `AccelRange` does not name, answers `None`, and so does a code the
+// part does not use.
+pub fn range_of_code(code: Int) -> ?AccelRange
+    match code
+        0 => Some(AccelRange2g)
+        1 => Some(AccelRange4g)
+        3 => Some(AccelRange8g)
+        4 => Some(AccelRange16g)
+        _ => None
+
+// The FSCALE code of a devices-nv range.
+pub fn code_of_range(r: AccelRange) -> Int
+    match r
+        AccelRange2g  => 0
+        AccelRange4g  => 1
+        AccelRange8g  => 3
+        AccelRange16g => 4
+
+// The output data rate of an ODR code in millihertz, 0 for power-down
+// and for a code the part does not use (Table 23).
+pub fn rate_mhz_of_code(code: Int) -> Int
+    match code
+        1 => 3125
+        2 => 6250
+        3 => 12500
+        4 => 25000
+        5 => 50000
+        6 => 100000
+        7 => 400000
+        8 => 800000
+        9 => 1600000
+        _ => 0
+
+// The ODR code of the slowest rate at or above `mhz` millihertz, or of
+// the fastest, 1600 Hz, for a rate beyond it; power-down, code 0, for
+// a rate of 0 or less.
+pub fn code_for_rate_mhz(mhz: Int) -> Int
+    if mhz <= 0
+        return 0
+    for code in 1..9
+        if rate_mhz_of_code(code) >= mhz
+            return code
+    9
+
+// The signed count of an axis whose low byte is at `i` of `b`: both
+// bytes taken unsigned, then the 16 bits read as two's complement.
+// STM32CubeF4's `LIS3DSH_ReadACC` adds a sign-extended low byte to the
+// high byte shifted, and reads 256 counts low for a low byte of 0x80 or
+// more.
+fn axis(b: DevBytes, i: Int) -> Int
+    dev_bus.dev_sign_extend((b[i + 1] as Int << 8) | b[i] as Int, 16)
+
+// An axis's count in milli-g at `ug` micro-g per step.  The product is
+// rounded toward zero, as a reading in whole milli-g is.
+pub fn milli_g(count: Int, ug: Int) -> Int
+    count * ug / 1000
+
+// The FSCALE code the part is set to, or -1 when no part answers.
+fn scale_code_read<B: SpiBus, G: GpioOut>(bus: B, gpio: G, w: DeviceWiring) -> Int [hw]
+    let v = reg_read(bus, gpio, w, CTRL_REG5) ?? 0xFF
+    if not ctrl5_answered(v)
+        return -1
+    fscale_of_ctrl5(v)
+
+// The most recent sample, converted at the scale the part is set to:
+// CTRL_REG5, then the six output registers in one transaction, so with
+// BDU set the three axes come from one sample.  STM32CubeF4's
+// `LIS3DSH_ReadACC` reads them in six transactions without BDU, and can
+// mix the bytes of two samples.  The register between CTRL_REG6 and
+// STATUS, 0x26, is not one the data sheet names, so the scale is read in
+// a transaction of its own rather than in one burst from CTRL_REG5.
+// `None` when no part answers.
+pub fn sample_read<B: SpiBus, G: GpioOut>(bus: B, gpio: G, w: DeviceWiring) -> ?AccelMilliG [hw]
+    let code = scale_code_read(bus, gpio, w)
+    if code < 0
+        return None
+    var b: DevBytes = Vec.new()
+    let _ = reg_read_into(bus, gpio, w, OUT_X_L, 6, b)
+    let k = ug_per_lsb(code)
+    Some(AccelMilliG { x: milli_g(axis(b, 0), k), y: milli_g(axis(b, 2), k), z: milli_g(axis(b, 4), k) })
+
+// Whether a new sample of all three axes has completed since the last
+// read: STATUS's ZYXDA.  An absent part reads 0xFF, so this answers true
+// for it; `sample_read` then answers `None`.
+pub fn sample_ready<B: SpiBus, G: GpioOut>(bus: B, gpio: G, w: DeviceWiring) -> Bool [hw]
+    ((reg_read(bus, gpio, w, STATUS) ?? 0) & STATUS_ZYXDA) != 0
+
+// The full scale in g, 2, 4, 6, 8 or 16, and 0 when no part answers.
+pub fn scale_read<B: SpiBus, G: GpioOut>(bus: B, gpio: G, w: DeviceWiring) -> Int [hw]
+    scale_g_of_code(scale_code_read(bus, gpio, w))
+
+// Sets the full scale to `g`, keeping CTRL_REG5's other bits: whether the
+// part took it.  The whole FSCALE field, 0x38, is cleared first;
+// STM32CubeF4's `LIS3DSH_FullScaleCmd` clears only 0x20 and cannot go
+// from ±4 g back to ±2 g.  A scale the part does not have is refused, and so is a
+// part that does not answer.
+pub fn scale_write<B: SpiBus, G: GpioOut>(bus: B, gpio: G, w: DeviceWiring, g: Int) -> Bool [hw]
+    let code = code_of_scale_g(g)
+    let old = reg_read(bus, gpio, w, CTRL_REG5) ?? 0xFF
+    if code < 0 or not ctrl5_answered(old)
+        return false
+    reg_write(bus, gpio, w, CTRL_REG5, (old & 0xC7) | (code << 3))
+
+// The output data rate in millihertz, 0 when the part is powered down or
+// no part answers.
+pub fn rate_read<B: SpiBus, G: GpioOut>(bus: B, gpio: G, w: DeviceWiring) -> Int [hw]
+    rate_mhz_of_code(((reg_read(bus, gpio, w, CTRL_REG4) ?? 0xFF) >> 4) & 15)
+
+// Sets the slowest rate at or above `mhz` millihertz, power-down for 0,
+// with CTRL_REG4's low bits (BDU and the axes) left as they were: the
+// rate the part took in millihertz, or -1 when it did not take it.  The
+// whole ODR field, 0xF0, is cleared first; STM32CubeF4's
+// `LIS3DSH_DataRateCmd` clears 0x70 and cannot leave 800 or 1600 Hz.
+pub fn rate_write<B: SpiBus, G: GpioOut>(bus: B, gpio: G, w: DeviceWiring, mhz: Int) -> Int [hw]
+    let code = code_for_rate_mhz(mhz)
+    let old = reg_read(bus, gpio, w, CTRL_REG4) ?? 0
+    if not reg_write(bus, gpio, w, CTRL_REG4, (code << 4) | (old & 0x0F))
+        return -1
+    rate_mhz_of_code(code)
+
+// Sets the slowest rate at or above `hz` hertz, 3.125 Hz for 3 or less,
+// and answers the rate taken in whole hertz (3, 6 and 12 for the three
+// slowest), or 0 when the part did not take it.  This is
+// `accel_set_rate_hz`.
+pub fn rate_hz_write<B: SpiBus, G: GpioOut>(bus: B, gpio: G, w: DeviceWiring, hz: Int) -> Int [hw]
+    let mhz = if hz < 1
+        1
+    else
+        hz * 1000
+    let got = rate_write(bus, gpio, w, mhz)
+    if got < 0
+        return 0
+    got / 1000
+
+// The identity at WHO_AM_I, or `None` when no part answers (the byte
+// reads 0xFF or 0x00).
+pub fn id_read<B: SpiBus, G: GpioOut>(bus: B, gpio: G, w: DeviceWiring) -> ?DeviceId [hw]
+    let who = reg_read(bus, gpio, w, WHO_AM_I) ?? 0xFF
+    if who == 0xFF or who == 0
+        return None
+    Some(DeviceId { who: who, rev: None })
+
+// Brings the part up: chip select driven high first, as STM32CubeF4's
+// `ACCELERO_IO_Init` and jbangelo's `new_spi` do, so the part does not
+// see a select edge from the pin's reset state; the bus at 10 MHz in
+// mode 3, the data sheet's (the BSP runs mode 0); one read spent;
+// WHO_AM_I checked before any setting, as `BSP_ACCELERO_Init` does; then
+// the address increment on (jbangelo's crate leaves it at its reset
+// value), ±2 g, 100 Hz with block data update and the three axes on, and
+// data-ready on INT1, active high and pulsed.  The interrupt pin, when
+// the wiring has one, is made an input.  Answers whether the part answered as an
+// LIS3DSH and took every setting.
+pub fn start<B: SpiBus, G: GpioOut>(bus: B, gpio: G, w: DeviceWiring) -> Bool [hw]
+    let Some(cs) = w.cs else return false
+    // The output level first, then the mode, so the pin never drives low.
+    gpio.set(cs, 1)
+    gpio.mode(cs, 1)
+    if let Some(irq) = w.irq
+        gpio.mode(irq, 0)
+    bus.init(SPI_HZ, SPI_MODE)
+    // The part listens on its I2C interface while chip select is high
+    // (§ 5.2), with SPC and SDI as SCL and SDA, so the edges the controller
+    // makes as it takes its pins can leave that interface mid-frame: on
+    // the bench, the first transaction after the bus is started answers
+    // 0xFF, and the next ones answer.  One read is spent to bring the
+    // interface back in step.
+    let _first = reg_read(bus, gpio, w, WHO_AM_I)
+    if (reg_read(bus, gpio, w, WHO_AM_I) ?? 0xFF) != ID_LIS3DSH
+        return false
+    // Each setting is written and read back; the first the part refuses
+    // ends the bring-up.
+    reg_write(bus, gpio, w, CTRL_REG6, CTRL6_ADD_INC) and reg_write(bus, gpio, w, CTRL_REG5, 0) and reg_write(bus, gpio, w, CTRL_REG4, (ODR_BEGIN << 4) | CTRL4_BDU_XYZ) and reg_write(bus, gpio, w, CTRL_REG3, CTRL3_DRDY_INT1)
+
+// The level of the part's INT1 line on the board, 1 or 0, or -1 for a
+// wiring with no interrupt pin.  After `start` the line pulses high for
+// about 50 us at each new sample.
+pub fn irq_level_of<G: GpioOut>(gpio: G, w: DeviceWiring) -> Int [hw]
+    let Some(irq) = w.irq else return -1
+    gpio.get(irq)
+
+// The part on a board: the SPI bus, the board's GPIO for the chip select
+// and the interrupt line, and the wiring.
+pub @value
+struct Lis3dsh
+    bus: BoardSpi
+    pins: BoardGpio
+    w: DeviceWiring
+
+impl Lis3dsh
+    // The part on the board's SPI bus with the chip select `w.cs`, as a
+    // board's device table builds it.  Nothing is sent.
+    fn attach(bus: BoardSpi, pins: BoardGpio, w: DeviceWiring) -> Lis3dsh
+        Lis3dsh { bus: bus, pins: pins, w: w }
+
+    // Brings the part up (`start`): whether it answered as an LIS3DSH and
+    // took every setting.
+    fn begin(self) -> Bool [hw]
+        start(self.bus, self.pins, self.w)
+
+    // The full scale in g: 2, 4, 6, 8 or 16, and 0 when no part answers.
+    fn scale_g(self) -> Int [hw]
+        scale_read(self.bus, self.pins, self.w)
+
+    // Sets the full scale to 2, 4, 6, 8 or 16 g: whether the part took
+    // it.  ±6 g is reached here; devices-nv's `AccelRange` has no such
+    // range.
+    fn set_scale_g(self, g: Int) -> Bool [hw]
+        scale_write(self.bus, self.pins, self.w, g)
+
+    // The output data rate in millihertz: 3125 for 3.125 Hz up to
+    // 1600000 for 1600 Hz, and 0 when the part is powered down or does
+    // not answer.
+    fn rate_mhz(self) -> Int [hw]
+        rate_read(self.bus, self.pins, self.w)
+
+    // Sets the slowest rate at or above `mhz` millihertz, or powers the
+    // part down for 0, and answers the rate taken in millihertz, -1 when
+    // the part did not take it.
+    fn set_rate_mhz(self, mhz: Int) -> Int [hw]
+        rate_write(self.bus, self.pins, self.w, mhz)
+
+    // The level of the INT1 line, -1 when the wiring has none.
+    fn irq_level(self) -> Int [hw]
+        irq_level_of(self.pins, self.w)
+
+    // One register's byte, `None` for a wiring with no chip select.
+    fn reg(self, r: Int) -> ?Int [hw]
+        reg_read(self.bus, self.pins, self.w, r)
+
+    // Writes a register and reads it back: whether the part holds it.
+    fn set_reg(self, r: Int, v: Int) -> Bool [hw]
+        reg_write(self.bus, self.pins, self.w, r, v)
+
+impl Accelerometer[hw] for Lis3dsh
+    fn accel_read(self) -> ?AccelMilliG [hw]
+        sample_read(self.bus, self.pins, self.w)
+
+    fn accel_ready(self) -> Bool [hw]
+        sample_ready(self.bus, self.pins, self.w)
+
+    // ±2 g for ±6 g, which `AccelRange` cannot name, and for a part that
+    // does not answer; `scale_g` tells the two apart.
+    fn accel_range(self) -> AccelRange [hw]
+        let code = code_of_scale_g(scale_read(self.bus, self.pins, self.w))
+        range_of_code(code) ?? AccelRange2g
+
+    fn accel_set_range(self, r: AccelRange) -> Bool [hw]
+        scale_write(self.bus, self.pins, self.w, scale_g_of_code(code_of_range(r)))
+
+    // The rate in whole hertz: 3, 6 and 12 for the three slowest rates,
+    // which `rate_mhz` answers exactly.
+    fn accel_rate_hz(self) -> Int [hw]
+        rate_read(self.bus, self.pins, self.w) / 1000
+
+    // The slowest rate at or above `hz`, 3.125 Hz for 3 or less, in whole
+    // hertz; 0 when the part did not take it.
+    fn accel_set_rate_hz(self, hz: Int) -> Int [hw]
+        rate_hz_write(self.bus, self.pins, self.w, hz)
+
+impl Identifiable[hw] for Lis3dsh
+    // WHO_AM_I: 0x3F for an LIS3DSH; the part keeps no revision register,
+    // so `rev` is `None`.
+    fn device_id(self) -> ?DeviceId [hw]
+        id_read(self.bus, self.pins, self.w)
