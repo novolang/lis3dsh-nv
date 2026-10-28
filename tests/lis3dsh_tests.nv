@@ -170,7 +170,7 @@ fn test_a_write_is_read_back() [io, hw]
 @test
 fn test_a_wiring_with_no_chip_select_sends_nothing() [io, hw]
     let p = part()
-    let w = DeviceWiring { bus: 0, addr: None, cs: None, irq: None }
+    let w = DeviceWiring { bus: 0, addr: None, cs: None, irq: None, en: None }
     test.assert(lis3dsh.reg_read(p, pins(p), w, 0x0F) == None)
     test.assert(not lis3dsh.reg_write(p, pins(p), w, 0x20, 0x67))
     test.assert(lis3dsh.sample_read(p, pins(p), w) == None)
