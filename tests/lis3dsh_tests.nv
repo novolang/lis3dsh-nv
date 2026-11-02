@@ -136,7 +136,7 @@ fn test_a_sample_is_one_read_of_six_bytes_without_bit_6() [io, hw]
             test.assert_eq(s.x, 60)
             test.assert_eq(s.y, 120)
             test.assert_eq(s.z, 180)
-        None => test.assert(false)
+        None    => test.assert(false)
     // The last transaction is the burst: OUT_X_L with RW set, bit 6 clear,
     // six bytes moved.
     test.assert_eq(at(p.st, 6), 0xA8)
@@ -151,13 +151,13 @@ fn test_the_burst_needs_the_address_increment() [io, hw]
     poke(p, 0x25, 0x00)
     match lis3dsh.sample_read(p, pins(p), wiring())
         Some(s) => test.assert(s.y != 120)
-        None => test.assert(false)
+        None    => test.assert(false)
     // The bring-up sets it.
     test.assert(lis3dsh.start(p, pins(p), wiring()))
     test.assert_eq(at(p.regs, 0x25), 0x10)
     match lis3dsh.sample_read(p, pins(p), wiring())
         Some(s) => test.assert_eq(s.y, 120)
-        None => test.assert(false)
+        None    => test.assert(false)
 
 @test
 fn test_a_write_is_read_back() [io, hw]
@@ -166,6 +166,44 @@ fn test_a_write_is_read_back() [io, hw]
     test.assert_eq(at(p.regs, 0x23), 0xC8)
     // The write's address byte has RW clear.
     test.assert_eq(at(p.st, 6), 0xA3)
+
+@test
+fn test_reg_read_into_fills_the_buffer_from_one_transaction() [io, hw]
+    let p = part()
+    poke(p, 0x28, 11)
+    poke(p, 0x29, 22)
+    poke(p, 0x2A, 33)
+    var dst: dev_bus.DevBytes = Vec.new()
+    test.assert(lis3dsh.reg_read_into(p, pins(p), wiring(), 0x28, 3, var dst))
+    test.assert_eq(dst[0] as Int, 11)
+    test.assert_eq(dst[1] as Int, 22)
+    test.assert_eq(dst[2] as Int, 33)
+    test.assert_eq(at(p.st, 6), 0xA8)
+    test.assert_eq(at(p.st, 5), 1)
+
+@test
+fn test_reg_read_into_refuses_a_wiring_with_no_chip_select() [io, hw]
+    let p = part()
+    let w = DeviceWiring { bus: 0, addr: None, cs: None, irq: None, en: None }
+    var dst: dev_bus.DevBytes = Vec.new()
+    test.assert(not lis3dsh.reg_read_into(p, pins(p), w, 0x28, 3, var dst))
+    test.assert_eq(at(p.st, 5), 0)
+
+@test
+fn test_the_fscale_code_is_bits_5_to_3_of_ctrl_reg5() [io, hw]
+    test.assert_eq(lis3dsh.fscale_of_ctrl5(0x00), 0)
+    test.assert_eq(lis3dsh.fscale_of_ctrl5(0x08), 1)
+    test.assert_eq(lis3dsh.fscale_of_ctrl5(0x20), 4)
+    test.assert_eq(lis3dsh.fscale_of_ctrl5(0x38), 7)
+    test.assert_eq(lis3dsh.fscale_of_ctrl5(0xC7), 0)
+
+@test
+fn test_the_sensitivities_are_the_data_sheets_per_code() [io, hw]
+    test.assert_eq(lis3dsh.ug_per_lsb(0), 60)
+    test.assert_eq(lis3dsh.ug_per_lsb(1), 120)
+    test.assert_eq(lis3dsh.ug_per_lsb(2), 180)
+    test.assert_eq(lis3dsh.ug_per_lsb(3), 240)
+    test.assert_eq(lis3dsh.ug_per_lsb(4), 730)
 
 @test
 fn test_a_wiring_with_no_chip_select_sends_nothing() [io, hw]
@@ -191,11 +229,11 @@ fn test_negative_counts_are_sign_extended() [io, hw]
             test.assert_eq(s.x, 0)
             test.assert_eq(s.y, -1966)
             test.assert_eq(s.z, 1966)
-        None => test.assert(false)
+        None    => test.assert(false)
     put16(p, 0x28, -16667)
     match lis3dsh.sample_read(p, pins(p), wiring())
         Some(s) => test.assert_eq(s.x, -1000)
-        None => test.assert(false)
+        None    => test.assert(false)
 
 @test
 fn test_each_scale_has_its_sensitivity() [io, hw]
@@ -213,7 +251,7 @@ fn test_each_scale_has_its_sensitivity() [io, hw]
             Some(s) =>
                 test.assert_eq(s.x, want[i])
                 test.assert_eq(s.y, 0 - want[i])
-            None => test.assert(false)
+            None    => test.assert(false)
     // FSCALE sits in bits 5 to 3 of CTRL_REG5; ±16 g is 100.
     test.assert_eq(at(p.regs, 0x24), 0x20)
 
@@ -284,7 +322,7 @@ fn test_the_bring_up_writes_its_settings() [io, hw]
         Some(id) =>
             test.assert_eq(id.who, 0x3F)
             test.assert(id.rev == None)
-        None => test.assert(false)
+        None     => test.assert(false)
 
 @test
 fn test_another_part_is_refused() [io, hw]
