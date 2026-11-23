@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.1.3 — 2026-11-23
+
+The package asks for embedded-hal-nv ^0.4.0 (was ^0.2.1) and devices-nv ^0.4.0 (was ^0.3.2), the minor of both trait packages that the other drivers and the board packages ask for, so one version of each serves a program that takes this package beside any of them.  Under the older ranges, a program that named this package and a driver on 0.4 stopped with "no version of 'embedded-hal-nv' satisfies every requirement".
+
+No signature of the package changed; the suite passes without an edit.
+
+The STM32F407G-DISC1's `tests/accel_probe.nv`, which drives this driver through the board's devices block, builds against the package: flash 27,172 B before and 28,268 B after, the growth being devices-nv 0.4.0's traits in the probe's image.
+
 ## 0.1.2 — 2026-10-28
 
 The dependency requirement is raised: `devices-nv` from ^0.2.0 to ^0.3.2.  The newest version of each builds with no migration warning under the 0.22.0 compiler, and the older one drew E2050, E2052 or E2055 warnings into this package's build.  The tests and the magnetometer wiring carry the new `en` field of `DeviceWiring`, which devices-nv 0.3 added.  No signature and no behaviour changed.
